@@ -7,6 +7,8 @@ import {
     XCircle,
     Loader2,
     ArrowRight,
+    Search,
+    Filter,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 
@@ -37,7 +39,9 @@ const PIPELINE_STEPS = [
     { key: "decompose_facts", label: "Decomposing into Atomic Facts" },
     { key: "self_consistency_check", label: "Self-Consistency Check" },
     { key: "plan_verification", label: "Planning Verification" },
-    { key: "execute_verification", label: "Verifying Facts" },
+    { key: "evidence_grounding", label: "Grounding Against Evidence" },
+    { key: "execute_verification", label: "Verifying Facts (Multi-Perspective)" },
+    { key: "cross_examination", label: "Cross-Examining Uncertain Facts" },
     { key: "cross_reference", label: "Contradiction Detection" },
     { key: "self_critique", label: "Self-Critique (Reflexion)" },
     { key: "revise_document", label: "Revising Document" },
@@ -55,6 +59,8 @@ export default function Verification() {
     const [facts, setFacts] = useState<Fact[]>([]);
     const [complete, setComplete] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [filter, setFilter] = useState<FactStatus | "all">("all");
+    const [search, setSearch] = useState("");
     const started = useRef(false);
 
     const processSSE = useCallback(async () => {
@@ -62,7 +68,7 @@ export default function Verification() {
         started.current = true;
 
         try {
-            const response = await fetch(`/api/projects/${id}/verify`, {
+            const response = await fetch(`/api/v1/projects/${id}/verify`, {
                 method: "POST",
                 headers: { Accept: "text/event-stream" },
             });
@@ -234,49 +240,82 @@ export default function Verification() {
                         </div>
                     </div>
 
-                    <div className="space-y-2">
-                        <AnimatePresence>
-                            {facts.map((fact) => (
-                                <motion.div
-                                    key={fact.id}
-                                    initial={{ opacity: 0, y: 10, height: 0 }}
-                                    animate={{ opacity: 1, y: 0, height: "auto" }}
-                                    exit={{ opacity: 0 }}
-                                    className={`flex items-start gap-3 p-3 rounded-lg border ${fact.status === "verified"
-                                        ? "border-verified/20 bg-verified/5"
-                                        : fact.status === "uncertain"
-                                            ? "border-uncertain/20 bg-uncertain/5"
-                                            : fact.status === "hallucinated"
-                                                ? "border-hallucinated/20 bg-hallucinated/5"
-                                                : "border-blue-400/20 bg-blue-400/5"
-                                        }`}
+                    {/* Filters & Search */}
+                    <div className="flex flex-wrap items-center gap-2 mb-4">
+                        <div className="flex items-center gap-1 p-1 rounded-lg bg-white/5 border border-white/10">
+                            {(["all", "verified", "uncertain", "hallucinated"] as const).map((f) => (
+                                <button
+                                    key={f}
+                                    onClick={() => setFilter(f)}
+                                    className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${filter === f
+                                        ? f === "all" ? "bg-primary/20 text-primary"
+                                            : f === "verified" ? "bg-verified/20 text-verified"
+                                                : f === "uncertain" ? "bg-uncertain/20 text-uncertain"
+                                                    : "bg-hallucinated/20 text-hallucinated"
+                                        : "text-muted-foreground hover:text-foreground"}`}
                                 >
-                                    {statusIcon[fact.status]}
-                                    <div className="flex-1">
-                                        <p className="text-sm text-foreground">{fact.text}</p>
-                                        {fact.status !== "checking" && (
-                                            <div className="flex items-center gap-2 mt-1">
-                                                <div className="h-1.5 w-20 rounded-full bg-muted overflow-hidden">
-                                                    <motion.div
-                                                        className={`h-full rounded-full ${fact.confidence > 0.8
-                                                            ? "bg-verified"
-                                                            : fact.confidence > 0.5
-                                                                ? "bg-uncertain"
-                                                                : "bg-hallucinated"
-                                                            }`}
-                                                        initial={{ width: 0 }}
-                                                        animate={{ width: `${fact.confidence * 100}%` }}
-                                                        transition={{ duration: 0.5 }}
-                                                    />
-                                                </div>
-                                                <span className="text-xs text-muted-foreground">
-                                                    {Math.round(fact.confidence * 100)}%
-                                                </span>
-                                            </div>
-                                        )}
-                                    </div>
-                                </motion.div>
+                                    {f === "all" ? `All (${facts.length})` : `${f.charAt(0).toUpperCase() + f.slice(1)} (${scores[f as keyof typeof scores]})`}
+                                </button>
                             ))}
+                        </div>
+                        <div className="relative flex-1 min-w-[180px]">
+                            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+                            <input
+                                type="text"
+                                placeholder="Search facts..."
+                                value={search}
+                                onChange={(e) => setSearch(e.target.value)}
+                                className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="space-y-2 max-h-[600px] overflow-y-auto">
+                        <AnimatePresence>
+                            {facts
+                                .filter((f) => filter === "all" || f.status === filter)
+                                .filter((f) => !search || f.text.toLowerCase().includes(search.toLowerCase()))
+                                .map((fact) => (
+                                    <motion.div
+                                        key={fact.id}
+                                        initial={{ opacity: 0, y: 10, height: 0 }}
+                                        animate={{ opacity: 1, y: 0, height: "auto" }}
+                                        exit={{ opacity: 0 }}
+                                        className={`flex items-start gap-3 p-3 rounded-lg border ${fact.status === "verified"
+                                            ? "border-verified/20 bg-verified/5"
+                                            : fact.status === "uncertain"
+                                                ? "border-uncertain/20 bg-uncertain/5"
+                                                : fact.status === "hallucinated"
+                                                    ? "border-hallucinated/20 bg-hallucinated/5"
+                                                    : "border-blue-400/20 bg-blue-400/5"
+                                            }`}
+                                    >
+                                        {statusIcon[fact.status]}
+                                        <div className="flex-1">
+                                            <p className="text-sm text-foreground">{fact.text}</p>
+                                            {fact.status !== "checking" && (
+                                                <div className="flex items-center gap-2 mt-1">
+                                                    <div className="h-1.5 w-20 rounded-full bg-muted overflow-hidden">
+                                                        <motion.div
+                                                            className={`h-full rounded-full ${fact.confidence > 0.8
+                                                                ? "bg-verified"
+                                                                : fact.confidence > 0.5
+                                                                    ? "bg-uncertain"
+                                                                    : "bg-hallucinated"
+                                                                }`}
+                                                            initial={{ width: 0 }}
+                                                            animate={{ width: `${fact.confidence * 100}%` }}
+                                                            transition={{ duration: 0.5 }}
+                                                        />
+                                                    </div>
+                                                    <span className="text-xs text-muted-foreground">
+                                                        {Math.round(fact.confidence * 100)}%
+                                                    </span>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </motion.div>
+                                ))}
                         </AnimatePresence>
                         {facts.length === 0 && !error && (
                             <div className="text-center py-8 text-muted-foreground">

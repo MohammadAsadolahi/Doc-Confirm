@@ -95,6 +95,14 @@ class AtomicFact(BaseModel):
     section: str = ""
 
 
+class EvidenceDocument(BaseModel):
+    """A user-provided reference/source document for grounding verification."""
+    id: str = Field(default_factory=lambda: str(uuid4())[:8])
+    label: str = ""
+    content: str
+    uploaded_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Evidence(BaseModel):
     source: str
     text: str

@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from typing import Any
 
 from app.models.schemas import (
-    ProjectStatus, VerificationResult, Question, ConfidenceReport,
+    EvidenceDocument, ProjectStatus, VerificationResult, Question, ConfidenceReport,
 )
 
 
@@ -27,6 +27,9 @@ class ProjectSession:
         # Document
         self.document: str = ""
         self.prompt: str = ""
+
+        # Evidence / reference materials
+        self.evidence: list[EvidenceDocument] = []
 
         # Verification
         self.verification_result: VerificationResult | None = None

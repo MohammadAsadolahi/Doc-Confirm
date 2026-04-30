@@ -38,6 +38,7 @@ async def _run_verification(project_id: UUID):
     initial_state = {
         "prompt": session.prompt,
         "document": session.document,
+        "evidence_documents": session.evidence,
         "_emit": emit,
     }
 
@@ -71,7 +72,10 @@ async def _run_verification(project_id: UUID):
             session.status = ProjectStatus.QUIZ
             await emit("verification_complete", {"message": "Verification complete"})
         except Exception as e:
-            await emit("error", {"error": str(e)})
+            logger.exception(
+                "Verification pipeline error for project %s", project_id)
+            safe_msg = f"{type(e).__name__}: {str(e)[:200]}"
+            await emit("error", {"error": safe_msg})
         finally:
             await queue.put(None)  # Signal end
 
@@ -94,7 +98,10 @@ async def start_verification(project_id: UUID):
         raise HTTPException(status_code=404, detail="Project not found")
     if not session.document and not session.prompt:
         raise HTTPException(
-            status_code=400, detail="No document or prompt set")
+            status_code=409, detail="No document or prompt set. Upload or paste a document first.")
+    if session.status == ProjectStatus.VERIFYING:
+        raise HTTPException(
+            status_code=409, detail="Verification already in progress")
     return EventSourceResponse(_run_verification(project_id))
 
 
@@ -106,3 +113,21 @@ async def get_verification_results(project_id: UUID):
     if not session.verification_result:
         return {"status": "pending"}
     return session.verification_result.model_dump(mode="json")
+
+
+@router.get("/projects/{project_id}/verify/status")
+async def get_verification_status(project_id: UUID):
+    """Polling endpoint for verification pipeline status."""
+    session = get_session(project_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Project not found")
+    fact_count = 0
+    if session.verification_result:
+        fact_count = len(session.verification_result.facts)
+    return {
+        "project_id": str(project_id),
+        "status": session.status.value,
+        "fact_count": fact_count,
+        "has_report": session.report is not None,
+        "has_quiz": len(session.questions) > 0,
+    }

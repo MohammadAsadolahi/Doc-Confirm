@@ -1,4 +1,4 @@
-const API_BASE = "/api";
+const API_BASE = "/api/v1";
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
     const response = await fetch(`${API_BASE}${url}`, {
@@ -63,5 +63,19 @@ export const api = {
 
     report: {
         get: (projectId: string) => fetchJSON<any>(`/projects/${projectId}/report`),
+    },
+
+    evidence: {
+        list: (projectId: string) =>
+            fetchJSON<any>(`/projects/${projectId}/evidence`),
+        add: (projectId: string, data: { label?: string; content: string }) =>
+            fetchJSON<any>(`/projects/${projectId}/evidence`, {
+                method: "POST",
+                body: JSON.stringify(data),
+            }),
+        remove: (projectId: string, evidenceId: string) =>
+            fetchJSON<any>(`/projects/${projectId}/evidence/${evidenceId}`, {
+                method: "DELETE",
+            }),
     },
 };

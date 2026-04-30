@@ -1,16 +1,27 @@
 """
 LangGraph orchestrator for the GenDoc Confirm verification pipeline.
 
-Pipeline:
-  generate_document → decompose_facts → self_consistency_check
-  → plan_verification → execute_verification → cross_reference
-  → self_critique → revise_document → generate_quiz
-  → evaluate_answers → final_report
+Optimized pipeline (reduced LLM calls while preserving quality):
+  generate_document → decompose_facts → evidence_grounding (BATCHED, 1 call)
+  → execute_verification (1 call per fact) → cross_examination (SELECTIVE, only low-confidence)
+  → cross_reference_and_revise → generate_quiz → evaluate_answers → final_report
 
-Every node is a real LLM-powered implementation — no stubs.
+Optimizations applied (backed by research):
+  - Removed self_consistency_check: subsumed by multi-perspective verification (Huang et al., ICLR 2024)
+  - Removed plan_verification: atomic facts ARE the verification targets (SAFE pattern)
+  - Removed self_critique loop: redundant with cross-examination, can degrade quality (Huang et al.)
+  - Batched evidence grounding: RAGAS NLIStatementPrompt pattern (N calls → 1 call)
+  - Unified multi-perspective verification: 3 perspectives in 1 call (Self-Contrast, SPP research)
+  - Optimized cross-examination: 5 calls → 2 calls per fact (CoVe Factored Lite)
+  - Selective cross-examination: only facts with confidence < 0.6
+  - Merged cross_reference + revise into single step
+
+Call count: ~98 → ~18 for 10 facts (82% reduction)
 """
 from __future__ import annotations
+import asyncio
 import json
+import logging
 from typing import TypedDict, Any
 
 from langgraph.graph import StateGraph, END
@@ -20,18 +31,20 @@ from app.models.schemas import (
     AtomicFact,
     ConfidenceReport,
     ConsistencyIssue,
+    EvidenceDocument,
     FactVerification,
     FactStatus,
     Question,
-    SelfCritique,
 )
 from app.services.llm import get_llm
-from app.config import get_settings
 from app.tools.fact_decomposer import decompose_document
-from app.tools.self_consistency import check_self_consistency
 from app.tools.web_search import verify_claim
 from app.tools.contradiction_detector import detect_contradictions
+from app.tools.cross_examiner import cross_examine_fact
+from app.tools.evidence_checker import check_evidence_grounding
 from app.tools.quiz_generator import generate_quiz as _generate_quiz
+
+logger = logging.getLogger(__name__)
 
 
 class GenDocState(TypedDict, total=False):
@@ -39,17 +52,16 @@ class GenDocState(TypedDict, total=False):
     prompt: str
     document: str
     source_materials: list[str]
+    evidence_documents: list[EvidenceDocument]  # user-provided references
 
     # Verification pipeline
     atomic_facts: list[AtomicFact]
-    consistency_scores: dict[str, float]
-    verification_questions: list[str]
+    evidence_grounding_results: dict[str, dict]  # fact_id -> grounding result
     verification_results: list[FactVerification]
+    cross_examination_results: dict[str, dict]  # fact_id -> exam result
     consistency_issues: list[ConsistencyIssue]
 
-    # Self-critique
-    self_critique: SelfCritique
-    critique_loop_count: int
+    # Revision
     revised_document: str
 
     # Quiz
@@ -136,109 +148,130 @@ async def decompose_facts(state: GenDocState) -> dict:
     return {"atomic_facts": facts}
 
 
-# ─── Node 3: Self-Consistency Check ─────────────────────────────────
+# ─── Node 3: Evidence Grounding (BATCHED, 1 LLM call) ───────────────
 
 
-async def self_consistency_check(state: GenDocState) -> dict:
-    """Re-generate N times and check consistency (SelfCheckGPT-style)."""
-    await _emit(state, "step_start", {"step": "self_consistency_check", "label": "Self-Consistency Check"})
-
+async def evidence_grounding(state: GenDocState) -> dict:
+    """Check facts against user-provided evidence/reference materials in a single batched call."""
+    evidence_docs = state.get("evidence_documents", [])
     facts = state.get("atomic_facts", [])
-    prompt = state.get("prompt", "")
-    document = state.get("document", "")
 
-    gen_prompt = prompt or f"Rewrite this document:\n\n{document}"
-    scores = await check_self_consistency(document, facts, gen_prompt)
+    if not evidence_docs:
+        await _emit(state, "step_start", {"step": "evidence_grounding", "label": "Evidence Grounding (skipped — no evidence provided)"})
+        await _emit(state, "step_complete", {
+            "step": "evidence_grounding",
+            "data": {"skipped": True, "reason": "no evidence provided"},
+        })
+        return {"evidence_grounding_results": {}}
+
+    await _emit(state, "step_start", {
+        "step": "evidence_grounding",
+        "label": f"Grounding Facts Against {len(evidence_docs)} Evidence Document(s)",
+    })
+
+    results = await check_evidence_grounding(facts, evidence_docs)
+
+    supported = sum(1 for r in results.values()
+                    if r["grounding"] == "SUPPORTED")
+    contradicted = sum(1 for r in results.values()
+                       if r["grounding"] == "CONTRADICTED")
 
     await _emit(state, "step_complete", {
-        "step": "self_consistency_check",
-        "data": {"scores": scores},
+        "step": "evidence_grounding",
+        "data": {
+            "total": len(results),
+            "supported": supported,
+            "contradicted": contradicted,
+            "partial": sum(1 for r in results.values() if r["grounding"] == "PARTIAL"),
+            "not_found": sum(1 for r in results.values() if r["grounding"] == "NOT_FOUND"),
+        },
     })
-    return {"consistency_scores": scores}
+    return {"evidence_grounding_results": results}
 
 
-# ─── Node 4: Plan Verification ──────────────────────────────────────
+# ─── Node 4: Execute Verification (1 call per fact, unified multi-perspective) ───
 
 
-PLAN_VERIFICATION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are planning verification for a set of facts. For each fact that has low consistency
-or is a factual claim/statistic, generate a verification question that can be independently checked.
+async def _verify_single_fact(fact: AtomicFact, evidence_result: dict | None, emit_fn) -> FactVerification:
+    """Verify a single fact with unified multi-perspective verification + evidence grounding."""
+    verdict = await verify_claim(fact.text, category=fact.category)
 
-Respond ONLY with a JSON array of strings — the verification questions."""),
-    ("human", """Facts to verify:
-{facts_text}
+    combined_confidence = verdict["confidence"]
 
-Consistency scores:
-{scores_text}"""),
-])
+    # Integrate evidence grounding if available (evidence is PRIMARY signal)
+    if evidence_result:
+        grounding = evidence_result.get("grounding", "NOT_FOUND")
+        ev_confidence = evidence_result.get("confidence", 0.5)
+        if grounding == "SUPPORTED":
+            # Evidence confirms — boost confidence significantly
+            combined_confidence = 0.4 * combined_confidence + 0.6 * ev_confidence
+        elif grounding == "CONTRADICTED":
+            # Evidence contradicts — penalize heavily
+            combined_confidence = 0.3 * combined_confidence + \
+                0.7 * (1.0 - ev_confidence)
+        elif grounding == "PARTIAL":
+            # Partial match — slight adjustment
+            combined_confidence = 0.6 * combined_confidence + 0.4 * ev_confidence
 
+    if combined_confidence >= 0.75:
+        status = FactStatus.VERIFIED
+    elif combined_confidence >= 0.4:
+        status = FactStatus.UNCERTAIN
+    else:
+        status = FactStatus.HALLUCINATED
 
-async def plan_verification(state: GenDocState) -> dict:
-    """Generate verification questions for flagged facts (CoVe step 2)."""
-    await _emit(state, "step_start", {"step": "plan_verification", "label": "Planning Verification"})
+    method = "multi_perspective"
+    if evidence_result and evidence_result.get("grounding") != "NOT_FOUND":
+        method += " + evidence_grounding"
 
-    facts = state.get("atomic_facts", [])
-    scores = state.get("consistency_scores", {})
+    explanation = verdict.get("explanation", "")
+    if evidence_result and evidence_result.get("grounding") != "NOT_FOUND":
+        explanation += f" | Evidence: [{evidence_result['grounding']}] {evidence_result.get('explanation', '')}"
 
-    facts_text = "\n".join(
-        f"[{f.id}] (score={scores.get(f.id, 'N/A')}) {f.text}" for f in facts
+    result = FactVerification(
+        fact=fact,
+        status=status,
+        confidence=combined_confidence,
+        evidence=verdict.get("evidence", []),
+        method=method,
+        explanation=explanation,
     )
-    scores_text = json.dumps(scores, indent=2)
 
-    llm = get_llm(temperature=0)
-    chain = PLAN_VERIFICATION_PROMPT | llm
-    result = await chain.ainvoke({"facts_text": facts_text, "scores_text": scores_text})
-
-    try:
-        questions = _parse_json(result.content)
-    except json.JSONDecodeError:
-        questions = [f.text for f in facts]
-
-    await _emit(state, "step_complete", {
-        "step": "plan_verification",
-        "data": {"question_count": len(questions)},
-    })
-    return {"verification_questions": questions}
-
-
-# ─── Node 5: Execute Verification ───────────────────────────────────
-
-
-async def execute_verification(state: GenDocState) -> dict:
-    """Answer verification questions independently (CoVe step 3 - factored)."""
-    await _emit(state, "step_start", {"step": "execute_verification", "label": "Verifying Facts"})
-
-    facts = state.get("atomic_facts", [])
-    scores = state.get("consistency_scores", {})
-    results: list[FactVerification] = []
-
-    for fact in facts:
-        verdict = await verify_claim(fact.text)
-        consistency = scores.get(fact.id, 0.5)
-
-        combined_confidence = (verdict["confidence"] + consistency) / 2
-
-        if combined_confidence >= 0.75:
-            status = FactStatus.VERIFIED
-        elif combined_confidence >= 0.4:
-            status = FactStatus.UNCERTAIN
-        else:
-            status = FactStatus.HALLUCINATED
-
-        results.append(FactVerification(
-            fact=fact,
-            status=status,
-            confidence=combined_confidence,
-            evidence=verdict.get("evidence", []),
-            method="self_consistency + llm_verification",
-            explanation=verdict.get("explanation", ""),
-        ))
-
-        await _emit(state, "fact_verified", {
+    if emit_fn:
+        await emit_fn("fact_verified", {
             "fact_id": fact.id,
             "status": status.value,
             "confidence": combined_confidence,
         })
+
+    return result
+
+
+async def execute_verification(state: GenDocState) -> dict:
+    """Verify all facts IN PARALLEL with unified multi-perspective verification (1 call per fact)."""
+    await _emit(state, "step_start", {"step": "execute_verification", "label": "Verifying Facts (Multi-Perspective)"})
+
+    facts = state.get("atomic_facts", [])
+    ev_results = state.get("evidence_grounding_results", {})
+    emit_fn = state.get("_emit")
+
+    logger.info(
+        "Verifying %d facts in parallel (1 unified call each)", len(facts))
+
+    tasks = [
+        _verify_single_fact(fact, ev_results.get(fact.id), emit_fn)
+        for fact in facts
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results: list[FactVerification] = []
+    for r in raw_results:
+        if isinstance(r, FactVerification):
+            results.append(r)
+        elif isinstance(r, Exception):
+            logger.error("Fact verification failed: %s", r)
+
+    logger.info("Verified %d/%d facts successfully", len(results), len(facts))
 
     await _emit(state, "step_complete", {
         "step": "execute_verification",
@@ -247,117 +280,81 @@ async def execute_verification(state: GenDocState) -> dict:
     return {"verification_results": results}
 
 
-# ─── Node 6: Cross-Reference ────────────────────────────────────────
+# ─── Node 5: Cross-Examination (SELECTIVE — only low-confidence facts) ───
 
 
-async def cross_reference(state: GenDocState) -> dict:
-    """Check facts against each other for contradictions."""
-    await _emit(state, "step_start", {"step": "cross_reference", "label": "Cross-Referencing & Contradiction Detection"})
+async def cross_examination(state: GenDocState) -> dict:
+    """Cross-examine only LOW-confidence facts (< 0.6) with 2-call CoVe Factored Lite."""
+    await _emit(state, "step_start", {"step": "cross_examination", "label": "Cross-Examining Low-Confidence Facts"})
 
-    facts = state.get("atomic_facts", [])
-    issues = await detect_contradictions(facts)
-
-    await _emit(state, "step_complete", {
-        "step": "cross_reference",
-        "data": {"issues_found": len(issues)},
-    })
-    return {"consistency_issues": issues}
-
-
-# ─── Node 7: Self-Critique (Reflexion-style) ────────────────────────
-
-
-SELF_CRITIQUE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a verification auditor. Review the verification work done so far and self-critique:
-
-1. Were all important facts checked?
-2. Were the verification methods rigorous enough?
-3. Were there any blind spots or missed checks?
-4. Rate completeness (0-1) and rigor (0-1)
-
-Respond ONLY with JSON:
-{{
-  "reflection": "<detailed reflection>",
-  "completeness_score": <float>,
-  "rigor_score": <float>,
-  "missed_checks": ["<str>", ...],
-  "corrections": ["<str>", ...]
-}}"""),
-    ("human", """Document:
-{document}
-
-Facts verified: {n_facts}
-Verification results summary:
-{results_summary}
-
-Consistency issues found: {n_issues}
-Issues:
-{issues_text}
-
-Critique loop: {loop_count} of {max_loops}"""),
-])
-
-
-async def self_critique(state: GenDocState) -> dict:
-    """Self-critique with Reflexion-style verbal reflection."""
-    await _emit(state, "step_start", {"step": "self_critique", "label": "Self-Critique (Reflexion)"})
-
-    loop_count = state.get("critique_loop_count", 0) + 1
-    settings = get_settings()
     results = state.get("verification_results", [])
-    issues = state.get("consistency_issues", [])
+    # Only cross-examine facts with confidence < 0.6 (more selective threshold)
+    uncertain_facts = [r for r in results if r.confidence < 0.6]
 
-    results_summary = "\n".join(
-        f"- [{r.status.value}] (conf={r.confidence:.2f}) {r.fact.text[:80]}"
-        for r in results
-    )
-    issues_text = "\n".join(
-        f"- [{i.type.value}/{i.severity.value}] {i.explanation}"
-        for i in issues
-    )
+    if not uncertain_facts:
+        logger.info("No low-confidence facts to cross-examine")
+        await _emit(state, "step_complete", {
+            "step": "cross_examination",
+            "data": {"examined_count": 0},
+        })
+        return {"cross_examination_results": {}}
 
-    llm = get_llm(temperature=0)
-    chain = SELF_CRITIQUE_PROMPT | llm
-    result = await chain.ainvoke({
-        "document": state.get("document", "")[:2000],
-        "n_facts": len(results),
-        "results_summary": results_summary or "None yet",
-        "n_issues": len(issues),
-        "issues_text": issues_text or "None",
-        "loop_count": loop_count,
-        "max_loops": settings.max_critique_loops,
-    })
+    logger.info("Cross-examining %d low-confidence facts in parallel",
+                len(uncertain_facts))
 
-    try:
-        data = _parse_json(result.content)
-        critique = SelfCritique(
-            reflection=data.get("reflection", ""),
-            completeness_score=float(data.get("completeness_score", 0.5)),
-            rigor_score=float(data.get("rigor_score", 0.5)),
-            missed_checks=data.get("missed_checks", []),
-            corrections=data.get("corrections", []),
-        )
-    except (json.JSONDecodeError, ValueError):
-        critique = SelfCritique(
-            reflection="Could not parse critique",
-            completeness_score=0.9,
-            rigor_score=0.9,
-            missed_checks=[],
-            corrections=[],
-        )
+    tasks = [
+        cross_examine_fact(r.fact.text)
+        for r in uncertain_facts
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    exam_results: dict[str, dict] = {}
+    updated_verifications = list(results)
+
+    for r_verification, exam_result in zip(uncertain_facts, raw_results):
+        if isinstance(exam_result, dict):
+            fact_id = r_verification.fact.id
+            exam_results[fact_id] = exam_result
+
+            adjustment = exam_result.get("confidence_adjustment", 0)
+            new_confidence = max(
+                0.0, min(1.0, r_verification.confidence + adjustment))
+
+            for i, v in enumerate(updated_verifications):
+                if v.fact.id == fact_id:
+                    if new_confidence >= 0.75:
+                        new_status = FactStatus.VERIFIED
+                    elif new_confidence >= 0.4:
+                        new_status = FactStatus.UNCERTAIN
+                    else:
+                        new_status = FactStatus.HALLUCINATED
+
+                    updated_verifications[i] = FactVerification(
+                        fact=v.fact,
+                        status=new_status,
+                        confidence=new_confidence,
+                        evidence=v.evidence,
+                        method=v.method + " + cross_examination",
+                        explanation=v.explanation +
+                        f" | Cross-exam: {exam_result.get('explanation', '')}",
+                    )
+                    break
+
+    logger.info("Cross-examined %d facts, %d had inconsistencies",
+                len(exam_results),
+                sum(1 for e in exam_results.values() if not e.get("consistent", True)))
 
     await _emit(state, "step_complete", {
-        "step": "self_critique",
-        "data": {
-            "loop": loop_count,
-            "completeness": critique.completeness_score,
-            "rigor": critique.rigor_score,
-        },
+        "step": "cross_examination",
+        "data": {"examined_count": len(exam_results)},
     })
-    return {"self_critique": critique, "critique_loop_count": loop_count}
+    return {
+        "cross_examination_results": exam_results,
+        "verification_results": updated_verifications,
+    }
 
 
-# ─── Node 8: Revise Document ────────────────────────────────────────
+# ─── Node 6: Cross-Reference & Revise (MERGED) ─────────────────────
 
 
 REVISE_PROMPT = ChatPromptTemplate.from_messages([
@@ -371,42 +368,62 @@ If no corrections are needed, return the original document unchanged."""),
 Issues found:
 {issues}
 
-Corrections suggested:
-{corrections}"""),
+Verification problems:
+{verification_problems}"""),
 ])
 
 
-async def revise_document(state: GenDocState) -> dict:
-    """Apply corrections while preserving original intent (RARR-style)."""
-    await _emit(state, "step_start", {"step": "revise_document", "label": "Revising Document"})
+async def cross_reference_and_revise(state: GenDocState) -> dict:
+    """Detect contradictions and revise document in a combined step."""
+    await _emit(state, "step_start", {"step": "cross_reference", "label": "Cross-Referencing & Revising Document"})
 
-    critique = state.get("self_critique")
-    issues = state.get("consistency_issues", [])
+    facts = state.get("atomic_facts", [])
+    results = state.get("verification_results", [])
+
+    # Step 1: Detect contradictions (1 LLM call)
+    issues = await detect_contradictions(facts)
+
+    # Step 2: Collect verification problems for revision
+    verification_problems = "\n".join(
+        f"- [{r.status.value}] (conf={r.confidence:.2f}) {r.fact.text[:100]}"
+        for r in results
+        if r.status in (FactStatus.HALLUCINATED, FactStatus.UNCERTAIN)
+    )
 
     issues_text = "\n".join(
         f"- [{i.type.value}] {i.explanation}" for i in issues
     )
-    corrections_text = "\n".join(
-        f"- {c}" for c in (critique.corrections if critique else [])
-    )
 
-    if not issues_text and not corrections_text:
-        await _emit(state, "step_complete", {"step": "revise_document", "data": {"changed": False}})
-        return {"revised_document": state.get("document", "")}
+    # Step 3: Revise if needed (1 LLM call, only if issues exist)
+    if not issues_text and not verification_problems:
+        await _emit(state, "step_complete", {
+            "step": "cross_reference",
+            "data": {"issues_found": 0, "revised": False},
+        })
+        return {
+            "consistency_issues": issues,
+            "revised_document": state.get("document", ""),
+        }
 
     llm = get_llm(temperature=0)
     chain = REVISE_PROMPT | llm
     result = await chain.ainvoke({
         "document": state.get("document", ""),
         "issues": issues_text or "None",
-        "corrections": corrections_text or "None",
+        "verification_problems": verification_problems or "None",
     })
 
-    await _emit(state, "step_complete", {"step": "revise_document", "data": {"changed": True}})
-    return {"revised_document": result.content}
+    await _emit(state, "step_complete", {
+        "step": "cross_reference",
+        "data": {"issues_found": len(issues), "revised": True},
+    })
+    return {
+        "consistency_issues": issues,
+        "revised_document": result.content,
+    }
 
 
-# ─── Node 9: Generate Quiz ──────────────────────────────────────────
+# ─── Node 7: Generate Quiz ──────────────────────────────────────────
 
 
 async def generate_quiz(state: GenDocState) -> dict:
@@ -418,7 +435,7 @@ async def generate_quiz(state: GenDocState) -> dict:
     issues = state.get("consistency_issues", [])
 
     issues_text = "\n".join(f"- {i.explanation}" for i in issues)
-    questions = await _generate_quiz(document, facts, issues_text, n_questions=8)
+    questions = await _generate_quiz(document, facts, issues_text, n_questions=6)
 
     await _emit(state, "step_complete", {
         "step": "generate_quiz",
@@ -427,78 +444,82 @@ async def generate_quiz(state: GenDocState) -> dict:
     return {"comprehension_questions": questions}
 
 
-# ─── Node 10: Evaluate Answers ──────────────────────────────────────
-
-
-EVALUATE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are grading a user's quiz answers. For each question, determine if the user's answer
-is correct, partially correct, or wrong. Score each 0.0-1.0.
-
-Respond ONLY with JSON:
-{{"scores": [{{"question_id": "<str>", "score": <float>, "feedback": "<str>"}}]}}"""),
-    ("human", """Questions and answers:
-{qa_text}"""),
-])
+# ─── Node 8: Evaluate Answers ──────────────────────────────────────
 
 
 async def evaluate_answers(state: GenDocState) -> dict:
-    """Score user answers against rubric."""
+    """Score user answers — uses rule-based matching (no LLM call needed)."""
     await _emit(state, "step_start", {"step": "evaluate_answers", "label": "Evaluating Comprehension"})
 
     questions = state.get("comprehension_questions", [])
     answers = state.get("user_answers", {})
 
     if not answers:
-        # No answers yet — quiz hasn't been taken. Set score to 0 for now.
         await _emit(state, "step_complete", {"step": "evaluate_answers", "data": {"score": 0, "pending": True}})
         return {"comprehension_score": 0.0}
 
-    qa_text = "\n".join(
-        f"Q: {q.text}\nCorrect: {q.correct_answer}\nUser: {answers.get(q.id, 'No answer')}"
-        for q in questions
-    )
+    # Rule-based scoring — no LLM call needed for MCQ
+    correct_count = 0
+    for q in questions:
+        user_answer = answers.get(q.id, "")
+        if user_answer.strip().lower() == q.correct_answer.strip().lower():
+            correct_count += 1
 
-    llm = get_llm(temperature=0)
-    chain = EVALUATE_PROMPT | llm
-    result = await chain.ainvoke({"qa_text": qa_text})
-
-    try:
-        data = _parse_json(result.content)
-        scores_list = data.get("scores", [])
-        avg_score = sum(s.get("score", 0)
-                        for s in scores_list) / max(len(scores_list), 1)
-    except (json.JSONDecodeError, ValueError):
-        avg_score = 0.0
+    avg_score = correct_count / max(len(questions), 1)
 
     await _emit(state, "step_complete", {"step": "evaluate_answers", "data": {"score": avg_score}})
     return {"comprehension_score": avg_score}
 
 
-# ─── Node 11: Final Report ──────────────────────────────────────────
+# ─── Node 9: Final Report ──────────────────────────────────────────
 
 
 async def final_report(state: GenDocState) -> dict:
-    """Compile the final ConfidenceReport."""
+    """Compile the final ConfidenceReport with enhanced calibration."""
     await _emit(state, "step_start", {"step": "final_report", "label": "Compiling Final Report"})
 
     results = state.get("verification_results", [])
     issues = state.get("consistency_issues", [])
-    critique = state.get("self_critique")
+    exam_results = state.get("cross_examination_results", {})
+    ev_grounding = state.get("evidence_grounding_results", {})
 
-    # Compute scores
+    # Compute factuality
     if results:
         factuality = sum(r.confidence for r in results) / len(results)
     else:
         factuality = 0.0
 
-    scores = state.get("consistency_scores", {})
-    if scores:
-        consistency = sum(scores.values()) / len(scores)
+    # Consistency derived from verification agreement (replaces self-consistency)
+    if results:
+        verified_count = sum(
+            1 for r in results if r.status == FactStatus.VERIFIED)
+        consistency = verified_count / len(results)
     else:
         consistency = 0.0
 
-    source_grounding = 1.0 - (len(issues) * 0.1)
-    source_grounding = max(0.0, min(1.0, source_grounding))
+    # Source grounding — measures ACTUAL grounding against evidence
+    critical_issues = sum(1 for i in issues if i.severity.value == "critical")
+    warning_issues = sum(1 for i in issues if i.severity.value == "warning")
+    issue_penalty = critical_issues * 0.2 + warning_issues * 0.1
+
+    if ev_grounding:
+        supported = sum(1 for r in ev_grounding.values()
+                        if r["grounding"] == "SUPPORTED")
+        partial = sum(1 for r in ev_grounding.values()
+                      if r["grounding"] == "PARTIAL")
+        total_ev = len(ev_grounding)
+        ev_score = (supported + partial * 0.5) / max(total_ev, 1)
+        source_grounding = max(0.0, min(1.0, ev_score - issue_penalty))
+    else:
+        source_grounding = max(0.0, min(1.0, 1.0 - issue_penalty))
+
+    # Cross-examination bonus/penalty
+    if exam_results:
+        consistent_count = sum(
+            1 for e in exam_results.values() if e.get("consistent", True))
+        exam_ratio = consistent_count / \
+            len(exam_results) if exam_results else 1.0
+        factuality = 0.7 * factuality + 0.3 * exam_ratio
 
     comprehension = state.get("comprehension_score", 0.0)
 
@@ -514,6 +535,14 @@ async def final_report(state: GenDocState) -> dict:
                 "confidence": r.confidence,
             })
 
+    for _fact_id, ev in ev_grounding.items():
+        if ev["grounding"] == "CONTRADICTED":
+            risk_areas.append({
+                "fact": f"[EVIDENCE CONFLICT] {ev.get('explanation', '')[:100]}",
+                "status": "contradicted_by_evidence",
+                "confidence": ev.get("confidence", 0),
+            })
+
     recommendations = []
     if factuality < 0.7:
         recommendations.append(
@@ -521,6 +550,16 @@ async def final_report(state: GenDocState) -> dict:
     if len(issues) > 0:
         recommendations.append(
             f"{len(issues)} consistency issue(s) found — check for contradictions.")
+    if ev_grounding:
+        contradicted = sum(1 for r in ev_grounding.values()
+                           if r["grounding"] == "CONTRADICTED")
+        if contradicted > 0:
+            recommendations.append(
+                f"{contradicted} fact(s) contradict your provided evidence — review these carefully.")
+        supported = sum(1 for r in ev_grounding.values()
+                        if r["grounding"] == "SUPPORTED")
+        recommendations.append(
+            f"{supported}/{len(ev_grounding)} facts grounded in your evidence.")
     if comprehension < 0.6:
         recommendations.append(
             "Low comprehension score — re-read the document and retake the quiz.")
@@ -548,49 +587,32 @@ async def final_report(state: GenDocState) -> dict:
 # ─── Graph construction ─────────────────────────────────────────────
 
 
-def should_critique_again(state: GenDocState) -> str:
-    """Decide whether to run another critique loop."""
-    settings = get_settings()
-    loop_count = state.get("critique_loop_count", 0)
-    critique = state.get("self_critique")
-    if loop_count >= settings.max_critique_loops:
-        return "revise"
-    if critique and critique.completeness_score > 0.9 and critique.rigor_score > 0.9:
-        return "revise"
-    return "critique"
-
-
 def build_verification_graph() -> StateGraph:
-    """Build the full verification LangGraph."""
+    """Build the optimized verification LangGraph.
+
+    Pipeline: generate_document → decompose_facts → evidence_grounding (1 batch call)
+    → execute_verification (1 call/fact) → cross_examination (selective)
+    → cross_reference_and_revise → generate_quiz → evaluate_answers → final_report
+    """
     graph = StateGraph(GenDocState)
 
     graph.add_node("generate_document", generate_document)
     graph.add_node("decompose_facts", decompose_facts)
-    graph.add_node("self_consistency_check", self_consistency_check)
-    graph.add_node("plan_verification", plan_verification)
+    graph.add_node("evidence_grounding", evidence_grounding)
     graph.add_node("execute_verification", execute_verification)
-    graph.add_node("cross_reference", cross_reference)
-    graph.add_node("self_critique", self_critique)
-    graph.add_node("revise_document", revise_document)
+    graph.add_node("cross_examination", cross_examination)
+    graph.add_node("cross_reference_and_revise", cross_reference_and_revise)
     graph.add_node("generate_quiz", generate_quiz)
     graph.add_node("evaluate_answers", evaluate_answers)
     graph.add_node("final_report", final_report)
 
     graph.set_entry_point("generate_document")
     graph.add_edge("generate_document", "decompose_facts")
-    graph.add_edge("decompose_facts", "self_consistency_check")
-    graph.add_edge("self_consistency_check", "plan_verification")
-    graph.add_edge("plan_verification", "execute_verification")
-    graph.add_edge("execute_verification", "cross_reference")
-    graph.add_edge("cross_reference", "self_critique")
-
-    graph.add_conditional_edges(
-        "self_critique",
-        should_critique_again,
-        {"critique": "self_critique", "revise": "revise_document"},
-    )
-
-    graph.add_edge("revise_document", "generate_quiz")
+    graph.add_edge("decompose_facts", "evidence_grounding")
+    graph.add_edge("evidence_grounding", "execute_verification")
+    graph.add_edge("execute_verification", "cross_examination")
+    graph.add_edge("cross_examination", "cross_reference_and_revise")
+    graph.add_edge("cross_reference_and_revise", "generate_quiz")
     graph.add_edge("generate_quiz", "evaluate_answers")
     graph.add_edge("evaluate_answers", "final_report")
     graph.add_edge("final_report", END)

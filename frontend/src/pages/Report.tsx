@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import {
     Shield,
@@ -8,6 +8,10 @@ import {
     AlertTriangle,
     CheckCircle2,
     Loader2,
+    Download,
+    ChevronDown,
+    Copy,
+    Check,
 } from "lucide-react";
 import { useParams } from "react-router-dom";
 import { api } from "../lib/api";
@@ -42,6 +46,9 @@ export default function Report() {
     const { id } = useParams();
     const [report, setReport] = useState<any>(null);
     const [loading, setLoading] = useState(true);
+    const [exportOpen, setExportOpen] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const dropdownRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         if (!id) return;
@@ -50,6 +57,37 @@ export default function Report() {
             setLoading(false);
         }).catch(() => setLoading(false));
     }, [id]);
+
+    // Close dropdown on outside click
+    useEffect(() => {
+        const handler = (e: MouseEvent) => {
+            if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+                setExportOpen(false);
+            }
+        };
+        document.addEventListener("mousedown", handler);
+        return () => document.removeEventListener("mousedown", handler);
+    }, []);
+
+    const handleExport = async (format: "json" | "csv") => {
+        setExportOpen(false);
+        const response = await fetch(`/api/v1/projects/${id}/report/export?format=${format}`);
+        if (!response.ok) return;
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `gendoc-report-${id}.${format}`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    const handleCopy = async () => {
+        if (!report?.report) return;
+        await navigator.clipboard.writeText(JSON.stringify(report.report, null, 2));
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
 
     if (loading) {
         return <div className="flex items-center justify-center py-20"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>;
@@ -74,9 +112,40 @@ export default function Report() {
 
     return (
         <div className="space-y-6">
-            <div>
-                <h1 className="text-3xl font-bold text-foreground">Step 4: Confidence Report</h1>
-                <p className="text-muted-foreground mt-1">Your document's verification summary</p>
+            <div className="flex items-center justify-between">
+                <div>
+                    <h1 className="text-3xl font-bold text-foreground">Step 4: Confidence Report</h1>
+                    <p className="text-muted-foreground mt-1">Your document's verification summary</p>
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={handleCopy}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-sm text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+                    >
+                        {copied ? <Check className="w-4 h-4 text-verified" /> : <Copy className="w-4 h-4" />}
+                        {copied ? "Copied" : "Copy"}
+                    </button>
+                    <div className="relative" ref={dropdownRef}>
+                        <button
+                            onClick={() => setExportOpen(!exportOpen)}
+                            className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-lg text-sm font-medium"
+                        >
+                            <Download className="w-4 h-4" />
+                            Export
+                            <ChevronDown className="w-3 h-3" />
+                        </button>
+                        {exportOpen && (
+                            <div className="absolute right-0 mt-2 w-44 rounded-lg border border-white/10 bg-background shadow-xl z-10">
+                                <button onClick={() => handleExport("json")} className="w-full text-left px-4 py-2.5 text-sm text-foreground hover:bg-white/5 rounded-t-lg">
+                                    Export as JSON
+                                </button>
+                                <button onClick={() => handleExport("csv")} className="w-full text-left px-4 py-2.5 text-sm text-foreground hover:bg-white/5 rounded-b-lg">
+                                    Export as CSV
+                                </button>
+                            </div>
+                        )}
+                    </div>
+                </div>
             </div>
 
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="glass-card flex flex-col items-center py-8">
